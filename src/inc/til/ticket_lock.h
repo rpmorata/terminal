@@ -7,51 +7,46 @@
 
 namespace til
 {
-    // ticket_lock implements a classic fair lock.
-    //
+    // ticket_lock implements a fair lock.
+    // Unlike SRWLOCK, std::mutex, etc., forward progress for each thread is guaranteed.
+    // It exploits the fact that WaitOnAddress/WakeByAddressSingle form a natural queue.
     // Compared to a SRWLOCK this implementation is significantly more unsafe to use:
-    // Forgetting to call unlock or calling unlock more than once, will lead to deadlocks,
-    // as _now_serving will remain out of sync with _next_ticket and prevent any further lockings.
-    //
-    // I recommend to use the following with this class:
-    // * A low number of concurrent accesses (this lock doesn't scale well beyond 2 threads)
-    // * alignas(std::hardware_destructive_interference_size) to prevent false sharing
-    // * std::unique_lock or std::scoped_lock to prevent unbalanced lock/unlock calls
+    // Forgetting to call unlock or calling unlock more than once will lead to deadlocks.
     struct ticket_lock
     {
         void lock() noexcept
         {
-            const auto ticket = _next_ticket.fetch_add(1, std::memory_order_relaxed);
+            _state.fetch_add(1);
 
-            for (;;)
+            for (uint32_t state = 1;;)
             {
-                const auto current = _now_serving.load(std::memory_order_acquire);
-                if (current == ticket)
+                // In the first loop iteration we'll try to transition the lock from entirely unlocked (state = 0)
+                // to the first one to having it locked (state = 1 | locked). This way, the first thread to arrive
+                // here will never run into til::atomic_wait() unlike all other threads.
+                if (_state.compare_exchange_strong(state, state | locked, std::memory_order_acquire))
                 {
-                    break;
+                    return;
                 }
 
-                til::atomic_wait(_now_serving, current);
+                do
+                {
+                    til::atomic_wait(_state, state);
+                    state = _state.load(std::memory_order_relaxed);
+                } while (state & locked);
             }
         }
 
         void unlock() noexcept
         {
-            _now_serving.fetch_add(1, std::memory_order_release);
-            til::atomic_notify_all(_now_serving);
+            _state.fetch_sub(1 | locked, std::memory_order_release);
+            // MSDN says about WakeByAddressSingle:
+            // If multiple threads are waiting for this address, the system wakes the first thread to wait.
+            til::atomic_notify_one(_state);
         }
 
     private:
-        // You may be inclined to add alignas(std::hardware_destructive_interference_size)
-        // here to force the two atomics on separate cache lines, but I suggest to carefully
-        // benchmark such a change. Since this ticket_lock is primarily used to synchronize
-        // exactly 2 threads, it actually helps us that these atomic are on the same cache line
-        // as any change by one thread is flushed to the other, which will then read it anyways.
-        //
-        // Integer overflow doesn't break the algorithm, as these two
-        // atomics are treated more like "IDs" and less like counters.
-        std::atomic<uint32_t> _next_ticket{ 0 };
-        std::atomic<uint32_t> _now_serving{ 0 };
+        static constexpr uint32_t locked = 0x80000000;
+        alignas(std::hardware_destructive_interference_size) std::atomic<uint32_t> _state{ 0 };
     };
 
     struct recursive_ticket_lock
@@ -148,7 +143,7 @@ namespace til
 
     private:
         ticket_lock _lock;
-        std::atomic<uint32_t> _owner = 0;
+        alignas(std::hardware_destructive_interference_size) std::atomic<uint32_t> _owner = 0;
         uint32_t _recursion = 0;
     };
 
